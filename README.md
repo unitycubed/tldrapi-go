@@ -15,6 +15,18 @@ That's your `X-RapidAPI-Key`. Pass it to the SDK constructor.
 
 *Legacy path (deprecated): upper-right (?) → Legacy Developer Dashboard → Add New App → Authorization tab. The new Console path above is simpler.*
 
+The Authorization Key field is the same value in both places — RapidAPI just labels it differently depending on which interface you use:
+
+**New Console:**
+
+![RapidAPI Console — Authorization Method labeled "RAPIDAPI"](https://raw.githubusercontent.com/unitycubed/tldrapi-docs/main/img/rapidapi-key-label-console.png)
+
+**Legacy Developer Dashboard:**
+
+![RapidAPI Legacy Developer Dashboard — Authorization Method labeled "API key"](https://raw.githubusercontent.com/unitycubed/tldrapi-docs/main/img/rapidapi-key-label-legacy.png)
+
+
+
 ## Install
 
 ```sh
