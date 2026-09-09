@@ -44,7 +44,7 @@ const Version = "0.1.0"
 
 // DefaultRapidAPIHost is the RapidAPI hostname for TLDRapi. Swap in
 // ClientOptions.RapidAPIHost only if the listing is renamed.
-const DefaultRapidAPIHost = "tldrapi.p.rapidapi.com"
+const DefaultRapidAPIHost = "tldrapi-summarizer.p.rapidapi.com"
 
 const (
 	defaultTimeout   = 60 * time.Second
@@ -60,7 +60,7 @@ type ClientOptions struct {
 	RapidAPIKey string
 	// RapidAPIHost lets you override the RapidAPI hostname. Rarely
 	// needed — only if the listing is renamed. Defaults to
-	// tldrapi.p.rapidapi.com.
+	// tldrapi-summarizer.p.rapidapi.com.
 	RapidAPIHost string
 	// BaseURL lets you override the base URL entirely (staging,
 	// mock server, custom domain). Defaults to https://<RapidAPIHost>.

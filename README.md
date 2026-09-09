@@ -1,6 +1,6 @@
 # tldrapi-go — Go SDK for TLDRapi
 
-Official Go client for the [TLDRapi](https://unitycubed.dev/TLDRapi/)
+Official Go client for the [TLDRapi](https://tldrapi-summarizer.p.rapidapi.com/)
 text-summarization API. Zero third-party dependencies — uses only
 `net/http` and `encoding/json` from the standard library.
 
