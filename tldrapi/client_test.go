@@ -229,28 +229,37 @@ func TestRates(t *testing.T) {
 		if r.URL.Path != "/rates" || r.Method != "GET" {
 			t.Errorf("path=%s method=%s", r.URL.Path, r.Method)
 		}
-		_, _ = w.Write([]byte(`{"quick":1,"standard":5,"deep":30,"premium":110,"ultra":400,"updated_at":"2026-09-01"}`))
+		// Spec (openapi.yaml RatesResponse): tier ints nested under
+		// credits_per_call, timestamp under credit_costs_updated_at.
+		_, _ = w.Write([]byte(`{"credits_per_call":{"quick":1,"standard":5,"deep":30,"premium":110,"ultra":400},"credit_costs_updated_at":"2026-09-01","history_url":"https://tldrapi.com/TLDRapi/rates/history"}`))
 	})
 	defer srv.Close()
 	rates, err := c.Rates(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rates.Quick != 1 || rates.Ultra != 400 || rates.UpdatedAt != "2026-09-01" {
+	if rates.Quick != 1 || rates.Ultra != 400 ||
+		rates.CreditCostsUpdatedAt != "2026-09-01" ||
+		rates.UpdatedAt != "2026-09-01" ||
+		rates.HistoryURL != "https://tldrapi.com/TLDRapi/rates/history" {
 		t.Errorf("unexpected rates: %+v", rates)
 	}
 }
 
 func TestUsage(t *testing.T) {
 	srv, c := mockServer(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"period":"month","calls":42,"credits_charged":210,"credits_remaining":790}`))
+		// Spec (openapi.yaml UsageResponse). Pre-1.0 SDK asserted against
+		// period/calls/credits_charged/credits_remaining — none of which
+		// the server ever emitted.
+		_, _ = w.Write([]byte(`{"usage_count":42,"successful_requests":40,"failed_requests":2,"plan":"free","limits":{"per_minute":3,"daily":100,"credits":100,"concurrent":1}}`))
 	})
 	defer srv.Close()
 	u, err := c.Usage(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Calls != 42 || u.CreditsRemaining != 790 {
+	if u.UsageCount != 42 || u.SuccessfulRequests != 40 || u.FailedRequests != 2 ||
+		u.Plan != "free" || u.Limits.PerMinute != 3 || u.Limits.Credits != 100 {
 		t.Errorf("unexpected usage: %+v", u)
 	}
 }

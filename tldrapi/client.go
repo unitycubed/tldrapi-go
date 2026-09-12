@@ -32,8 +32,11 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -155,6 +158,22 @@ func (c *Client) Summarize(ctx context.Context, inputText string, opts Summarize
 	if opts.ModelAlias != "" {
 		body["model_alias"] = opts.ModelAlias
 	}
+	if opts.Config != nil && !opts.Config.IsZero() {
+		// Struct tags on SummarizeConfig drop nil fields automatically —
+		// marshal-then-unmarshal to get a nested map that plays nice with
+		// the surrounding map[string]any wire.
+		cfgBytes, err := json.Marshal(opts.Config)
+		if err != nil {
+			return nil, fmt.Errorf("tldrapi: marshal summarize config: %w", err)
+		}
+		var cfgMap map[string]any
+		if err := json.Unmarshal(cfgBytes, &cfgMap); err != nil {
+			return nil, fmt.Errorf("tldrapi: unmarshal summarize config: %w", err)
+		}
+		if len(cfgMap) > 0 {
+			body["config"] = cfgMap
+		}
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("tldrapi: marshal request: %w", err)
@@ -182,6 +201,9 @@ func (c *Client) Summarize(ctx context.Context, inputText string, opts Summarize
 }
 
 // Rates fetches /rates — the credit-per-call table for each quality tier.
+// Fields align with openapi.yaml RatesResponse. Pre-1.0 SDK read tier
+// ints at top-level and `updated_at`; the server has always nested them
+// under `credits_per_call` and emits `credit_costs_updated_at`.
 func (c *Client) Rates(ctx context.Context) (*Rates, error) {
 	rawBody, _, err := c.request(ctx, "GET", "/rates", nil, c.buildHeaders("", nil), 0)
 	if err != nil {
@@ -191,25 +213,35 @@ func (c *Client) Rates(ctx context.Context) (*Rates, error) {
 	if err := json.Unmarshal(rawBody, &m); err != nil {
 		m = map[string]any{}
 	}
-	toInt := func(k string, dflt int) int {
-		if v, ok := m[k].(float64); ok {
+	cpc, _ := m["credits_per_call"].(map[string]any)
+	toInt := func(src map[string]any, k string, dflt int) int {
+		if src == nil {
+			return dflt
+		}
+		if v, ok := src[k].(float64); ok {
 			return int(v)
 		}
 		return dflt
 	}
-	updated, _ := m["updated_at"].(string)
+	updated, _ := m["credit_costs_updated_at"].(string)
+	historyURL, _ := m["history_url"].(string)
 	return &Rates{
-		Quick:     toInt("quick", 1),
-		Standard:  toInt("standard", 5),
-		Deep:      toInt("deep", 30),
-		Premium:   toInt("premium", 110),
-		Ultra:     toInt("ultra", 400),
-		UpdatedAt: updated,
-		Raw:       m,
+		Quick:                toInt(cpc, "quick", 1),
+		Standard:             toInt(cpc, "standard", 5),
+		Deep:                 toInt(cpc, "deep", 30),
+		Premium:              toInt(cpc, "premium", 110),
+		Ultra:                toInt(cpc, "ultra", 400),
+		CreditCostsUpdatedAt: updated,
+		UpdatedAt:            updated, // Deprecated alias — same value as CreditCostsUpdatedAt.
+		HistoryURL:           historyURL,
+		Raw:                  m,
 	}, nil
 }
 
-// Usage fetches /usage — the customer's aggregate usage stats.
+// Usage fetches /usage — the customer's aggregate usage stats. Fields
+// align with openapi.yaml UsageResponse. Pre-1.0 SDK read
+// period/calls/credits_charged/credits_remaining — none of which the
+// server has ever emitted — so every field returned zero.
 func (c *Client) Usage(ctx context.Context) (*UsageStats, error) {
 	rawBody, _, err := c.request(ctx, "GET", "/usage", nil, c.buildHeaders("", nil), 0)
 	if err != nil {
@@ -219,19 +251,43 @@ func (c *Client) Usage(ctx context.Context) (*UsageStats, error) {
 	if err := json.Unmarshal(rawBody, &m); err != nil {
 		m = map[string]any{}
 	}
-	toInt := func(k string) int {
-		if v, ok := m[k].(float64); ok {
+	toInt := func(src map[string]any, k string) int {
+		if src == nil {
+			return 0
+		}
+		if v, ok := src[k].(float64); ok {
 			return int(v)
 		}
 		return 0
 	}
-	period, _ := m["period"].(string)
+	toFloat := func(src map[string]any, k string) float64 {
+		if src == nil {
+			return 0
+		}
+		if v, ok := src[k].(float64); ok {
+			return v
+		}
+		return 0
+	}
+	limitsRaw, _ := m["limits"].(map[string]any)
+	limits := UsageLimits{
+		PerMinute:  toInt(limitsRaw, "per_minute"),
+		Daily:      toInt(limitsRaw, "daily"),
+		Credits:    toInt(limitsRaw, "credits"),
+		Concurrent: toInt(limitsRaw, "concurrent"),
+	}
+	endpoints, _ := m["endpoints_used"].(map[string]any)
+	plan, _ := m["plan"].(string)
 	return &UsageStats{
-		Period:           period,
-		Calls:            toInt("calls"),
-		CreditsCharged:   toInt("credits_charged"),
-		CreditsRemaining: toInt("credits_remaining"),
-		Raw:              m,
+		UsageCount:            toInt(m, "usage_count"),
+		SuccessfulRequests:    toInt(m, "successful_requests"),
+		FailedRequests:        toInt(m, "failed_requests"),
+		AverageResponseTimeMs: toFloat(m, "average_response_time_ms"),
+		EndpointsUsed:         endpoints,
+		ErrorRate:             toFloat(m, "error_rate"),
+		Plan:                  plan,
+		Limits:                limits,
+		Raw:                   m,
 	}, nil
 }
 
@@ -397,4 +453,499 @@ func truncateForLog(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// ─── /convert/{json,html,md}-to-text (text-body) ──────────────────────
+
+// ConvertJsonToText normalizes a JSON string to plaintext via
+// POST /convert/json-to-text.
+func (c *Client) ConvertJsonToText(ctx context.Context, text string, opts ConvertTextOptions) (*ConvertResult, error) {
+	return c.convertText(ctx, "/convert/json-to-text", text, opts)
+}
+
+// ConvertHtmlToText strips HTML to clean plaintext via
+// POST /convert/html-to-text.
+func (c *Client) ConvertHtmlToText(ctx context.Context, text string, opts ConvertTextOptions) (*ConvertResult, error) {
+	return c.convertText(ctx, "/convert/html-to-text", text, opts)
+}
+
+// ConvertMdToText renders GitHub-flavored Markdown to plaintext via
+// POST /convert/md-to-text.
+func (c *Client) ConvertMdToText(ctx context.Context, text string, opts ConvertTextOptions) (*ConvertResult, error) {
+	return c.convertText(ctx, "/convert/md-to-text", text, opts)
+}
+
+func (c *Client) convertText(ctx context.Context, path, text string, opts ConvertTextOptions) (*ConvertResult, error) {
+	if text == "" {
+		return nil, errors.New("tldrapi: text must be non-empty")
+	}
+	payload, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return nil, fmt.Errorf("tldrapi: marshal convert request: %w", err)
+	}
+	headers := c.buildHeaders("", opts.ExtraHeaders)
+	if opts.AllowOverage {
+		headers["X-Allow-Overage"] = "true"
+	}
+	rawBody, respHeaders, err := c.request(ctx, "POST", path, payload, headers, opts.TimeoutSeconds)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildConvertResult(m, respHeaders), nil
+}
+
+// ─── /convert/{doc,doc-to-latex,docx}-to-text (multipart) ────────────
+
+// ConvertDocToText extracts plaintext from a doc/docx/odt/rtf file via
+// POST /convert/doc-to-text.
+func (c *Client) ConvertDocToText(ctx context.Context, file any, opts ConvertFileOptions) (*ConvertResult, error) {
+	return c.convertFile(ctx, "/convert/doc-to-text", file, opts)
+}
+
+// ConvertDocToLatex extracts LaTeX source from a doc/docx/odt/rtf file
+// via POST /convert/doc-to-latex.
+func (c *Client) ConvertDocToLatex(ctx context.Context, file any, opts ConvertFileOptions) (*ConvertResult, error) {
+	return c.convertFile(ctx, "/convert/doc-to-latex", file, opts)
+}
+
+// ConvertDocxToText is a deprecated alias for ConvertDocToText; kept
+// for backward compat with the previous endpoint name.
+func (c *Client) ConvertDocxToText(ctx context.Context, file any, opts ConvertFileOptions) (*ConvertResult, error) {
+	return c.convertFile(ctx, "/convert/docx-to-text", file, opts)
+}
+
+func (c *Client) convertFile(ctx context.Context, path string, file any, opts ConvertFileOptions) (*ConvertResult, error) {
+	body, contentType, err := buildMultipart(file, opts.Filename)
+	if err != nil {
+		return nil, err
+	}
+	headers := c.buildHeaders("", opts.ExtraHeaders)
+	delete(headers, "Content-Type")
+	headers["Content-Type"] = contentType
+	if opts.AllowOverage {
+		headers["X-Allow-Overage"] = "true"
+	}
+	rawBody, respHeaders, err := c.request(ctx, "POST", path, body, headers, opts.TimeoutSeconds)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildConvertResult(m, respHeaders), nil
+}
+
+// ConvertPdfToLatex extracts LaTeX from a PDF via
+// POST /convert/pdf-to-latex. On HTTP 202 the returned result carries
+// JobID/PollURL/Status="queued"; poll PdfStatus.
+func (c *Client) ConvertPdfToLatex(ctx context.Context, file any, opts ConvertPdfOptions) (*PdfConvertResult, error) {
+	body, contentType, err := buildMultipart(file, opts.Filename)
+	if err != nil {
+		return nil, err
+	}
+	headers := c.buildHeaders("", opts.ExtraHeaders)
+	delete(headers, "Content-Type")
+	headers["Content-Type"] = contentType
+	if opts.AllowOverage {
+		headers["X-Allow-Overage"] = "true"
+	}
+	if opts.Backend != "" {
+		switch opts.Backend {
+		case "auto", "text", "modal":
+		default:
+			return nil, fmt.Errorf("tldrapi: backend must be one of auto,text,modal (got %q)", opts.Backend)
+		}
+		headers["X-PDF-Backend"] = opts.Backend
+	}
+	// We need the raw response including status to distinguish 200 vs 202.
+	// c.request only surfaces success bodies without status. So thread a
+	// small wrapper: parse first, then decide sync vs async by inspecting
+	// the parsed body's `status` field (server sets "queued" on 202).
+	rawBody, respHeaders, err := c.request(ctx, "POST", "/convert/pdf-to-latex", body, headers, opts.TimeoutSeconds)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	statusStr, _ := m["status"].(string)
+	if statusStr == "queued" || statusStr == "running" {
+		return buildPdfAsync(m, respHeaders), nil
+	}
+	return buildPdfSync(m, respHeaders), nil
+}
+
+// PdfStatus polls the async /convert/pdf-to-latex/status/:job_id
+// endpoint. Returns a PdfConvertResult whose Status field is one of
+// queued, running, done, or failed.
+func (c *Client) PdfStatus(ctx context.Context, jobID string) (*PdfConvertResult, error) {
+	if jobID == "" {
+		return nil, errors.New("tldrapi: jobID required")
+	}
+	path := "/convert/pdf-to-latex/status/" + url.PathEscape(jobID)
+	rawBody, respHeaders, err := c.request(ctx, "GET", path, nil, c.buildHeaders("", nil), 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	statusStr, _ := m["status"].(string)
+	if statusStr == "queued" || statusStr == "running" {
+		return buildPdfAsync(m, respHeaders), nil
+	}
+	return buildPdfSync(m, respHeaders), nil
+}
+
+// ─── rates history + usage range ────────────────────────────────────
+
+// RatesHistory fetches the change history for tier credit costs via
+// GET /rates/history.
+func (c *Client) RatesHistory(ctx context.Context) (*RatesHistory, error) {
+	rawBody, _, err := c.request(ctx, "GET", "/rates/history", nil, c.buildHeaders("", nil), 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildRatesHistory(m), nil
+}
+
+// UsageRange fetches per-day usage between two YYYY-MM-DD dates via
+// GET /usage/range?from=...&to=...
+func (c *Client) UsageRange(ctx context.Context, from, to string) (*UsageRange, error) {
+	if from == "" || to == "" {
+		return nil, errors.New("tldrapi: from and to required (YYYY-MM-DD)")
+	}
+	qs := "?from=" + url.QueryEscape(from) + "&to=" + url.QueryEscape(to)
+	rawBody, _, err := c.request(ctx, "GET", "/usage/range"+qs, nil, c.buildHeaders("", nil), 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildUsageRange(m), nil
+}
+
+// ─── custom prompts (Business/Enterprise) ───────────────────────────
+
+// CustomPromptSubmit submits a custom voice prompt for review via
+// POST /custom-prompts/submit.
+func (c *Client) CustomPromptSubmit(ctx context.Context, voiceName, instruction string, opts CustomPromptSubmitOptions) (*CustomPromptResult, error) {
+	if voiceName == "" || instruction == "" {
+		return nil, errors.New("tldrapi: voiceName and instruction required")
+	}
+	body := map[string]any{"voice_name": voiceName, "instruction": instruction}
+	if opts.SessionID != "" {
+		body["session_id"] = opts.SessionID
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("tldrapi: marshal custom-prompt request: %w", err)
+	}
+	headers := c.buildHeaders("", opts.ExtraHeaders)
+	if opts.AllowOverage {
+		headers["X-Allow-Overage"] = "true"
+	}
+	rawBody, _, err := c.request(ctx, "POST", "/custom-prompts/submit", payload, headers, 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildCustomPromptResult(m), nil
+}
+
+// CustomPromptsList returns every custom prompt the caller has submitted
+// via POST /custom-prompts/list.
+func (c *Client) CustomPromptsList(ctx context.Context, opts CustomPromptListOptions) (*CustomPromptList, error) {
+	body := map[string]any{}
+	if opts.SessionID != "" {
+		body["session_id"] = opts.SessionID
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("tldrapi: marshal custom-prompt list request: %w", err)
+	}
+	rawBody, _, err := c.request(ctx, "POST", "/custom-prompts/list", payload, c.buildHeaders("", nil), 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildCustomPromptList(m), nil
+}
+
+// CustomPromptGet returns the full detail of a single custom prompt via
+// GET /custom-prompts/:id.
+func (c *Client) CustomPromptGet(ctx context.Context, promptID string) (*CustomPromptDetail, error) {
+	if promptID == "" {
+		return nil, errors.New("tldrapi: promptID required")
+	}
+	path := "/custom-prompts/" + url.PathEscape(promptID)
+	rawBody, _, err := c.request(ctx, "GET", path, nil, c.buildHeaders("", nil), 0)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	_ = json.Unmarshal(rawBody, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return buildCustomPromptDetail(m), nil
+}
+
+// ─── multipart + response builders ──────────────────────────────────
+
+// buildMultipart builds a multipart/form-data body from a file input.
+// Accepted inputs: string (filesystem path), []byte, io.Reader.
+// Returns body bytes + Content-Type (with boundary).
+func buildMultipart(file any, filename string) ([]byte, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	var reader io.Reader
+	switch v := file.(type) {
+	case string:
+		f, err := os.Open(v)
+		if err != nil {
+			return nil, "", fmt.Errorf("tldrapi: open %s: %w", v, err)
+		}
+		defer f.Close()
+		reader = f
+		if filename == "" {
+			filename = filepath.Base(v)
+		}
+	case []byte:
+		reader = bytes.NewReader(v)
+	case io.Reader:
+		reader = v
+	default:
+		return nil, "", fmt.Errorf("tldrapi: unsupported file input type %T (want string path, []byte, or io.Reader)", file)
+	}
+	if filename == "" {
+		filename = "upload"
+	}
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, "", fmt.Errorf("tldrapi: create form-file: %w", err)
+	}
+	if _, err := io.Copy(part, reader); err != nil {
+		return nil, "", fmt.Errorf("tldrapi: copy file: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("tldrapi: close multipart: %w", err)
+	}
+	return buf.Bytes(), writer.FormDataContentType(), nil
+}
+
+func toIntOrDefault(m map[string]any, k string, dflt int) int {
+	if m == nil {
+		return dflt
+	}
+	if v, ok := m[k].(float64); ok {
+		return int(v)
+	}
+	return dflt
+}
+
+func buildConvertResult(m map[string]any, h http.Header) *ConvertResult {
+	warnings, _ := m["warnings"].([]any)
+	return &ConvertResult{
+		Output:      stringOrEmpty(m["output"]),
+		OutputFormat: stringOrEmpty(m["output_format"]),
+		InputFormat: stringOrEmpty(m["input_format"]),
+		InputBytes:  toIntOrDefault(m, "input_bytes", 0),
+		OutputChars: toIntOrDefault(m, "output_chars", 0),
+		ElapsedMs:   toIntOrDefault(m, "elapsed_ms", 0),
+		RequestID:   firstNonEmpty(stringOrEmpty(m["request_id"]), h.Get("X-Request-Id")),
+		Warnings:    warnings,
+		Raw:         m,
+	}
+}
+
+func buildPdfSync(m map[string]any, h http.Header) *PdfConvertResult {
+	warnings, _ := m["warnings"].([]any)
+	return &PdfConvertResult{
+		Output:           stringOrEmpty(m["output"]),
+		OutputFormat:     stringOrEmpty(m["output_format"]),
+		InputFormat:      firstNonEmpty(stringOrEmpty(m["input_format"]), "pdf"),
+		InputBytes:       toIntOrDefault(m, "input_bytes", 0),
+		Pages:            toIntOrDefault(m, "pages", 0),
+		ElapsedMs:        toIntOrDefault(m, "elapsed_ms", 0),
+		Backend:          stringOrEmpty(m["backend"]),
+		RequestID:        firstNonEmpty(stringOrEmpty(m["request_id"]), h.Get("X-Request-Id")),
+		Warnings:         warnings,
+		JobID:            stringOrEmpty(m["job_id"]),
+		Status:           firstNonEmpty(stringOrEmpty(m["status"]), "done"),
+		PollURL:          stringOrEmpty(m["poll_url"]),
+		EstimatedSeconds: toIntOrDefault(m, "estimated_seconds", 0),
+		Raw:              m,
+	}
+}
+
+func buildPdfAsync(m map[string]any, h http.Header) *PdfConvertResult {
+	warnings, _ := m["warnings"].([]any)
+	return &PdfConvertResult{
+		InputFormat:      "pdf",
+		InputBytes:       toIntOrDefault(m, "input_bytes", 0),
+		Pages:            toIntOrDefault(m, "pages", 0),
+		Backend:          stringOrEmpty(m["backend"]),
+		RequestID:        firstNonEmpty(stringOrEmpty(m["request_id"]), h.Get("X-Request-Id")),
+		Warnings:         warnings,
+		JobID:            stringOrEmpty(m["job_id"]),
+		Status:           firstNonEmpty(stringOrEmpty(m["status"]), "queued"),
+		PollURL:          stringOrEmpty(m["poll_url"]),
+		EstimatedSeconds: toIntOrDefault(m, "estimated_seconds", 0),
+		Raw:              m,
+	}
+}
+
+func buildRatesHistory(m map[string]any) *RatesHistory {
+	raw, _ := m["history"].([]any)
+	out := make([]RatesHistoryChange, 0, len(raw))
+	for _, r := range raw {
+		row, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, RatesHistoryChange{
+			ChangedAt:     stringOrEmpty(row["changed_at"]),
+			Tier:          stringOrEmpty(row["tier"]),
+			CreditsBefore: toIntOrDefault(row, "credits_before", 0),
+			CreditsAfter:  toIntOrDefault(row, "credits_after", 0),
+			Reason:        stringOrEmpty(row["reason"]),
+			Operator:      stringOrEmpty(row["operator"]),
+		})
+	}
+	return &RatesHistory{
+		History:      out,
+		RangeDays:    toIntOrDefault(m, "range_days", 30),
+		TotalChanges: toIntOrDefault(m, "total_changes", len(out)),
+		Raw:          m,
+	}
+}
+
+func buildUsageRange(m map[string]any) *UsageRange {
+	raw, _ := m["daily"].([]any)
+	daily := make([]UsageRangeDay, 0, len(raw))
+	for _, r := range raw {
+		row, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		daily = append(daily, UsageRangeDay{
+			Date:        stringOrEmpty(row["date"]),
+			CreditsUsed: toIntOrDefault(row, "credits_used", 0),
+			CallCount:   toIntOrDefault(row, "call_count", 0),
+		})
+	}
+	return &UsageRange{
+		From:        stringOrEmpty(m["from"]),
+		To:          stringOrEmpty(m["to"]),
+		CreditsUsed: toIntOrDefault(m, "credits_used", 0),
+		Daily:       daily,
+		Raw:         m,
+	}
+}
+
+func buildCustomPromptResult(m map[string]any) *CustomPromptResult {
+	status := stringOrEmpty(m["status"])
+	approvedFlag, _ := m["approved"].(bool)
+	superseded := []string{}
+	if raw, ok := m["superseded_ids"].([]any); ok {
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				superseded = append(superseded, s)
+			}
+		}
+	}
+	updatedInPlace, _ := m["updated_in_place"].(bool)
+	return &CustomPromptResult{
+		ID:              stringOrEmpty(m["id"]),
+		VoiceName:       stringOrEmpty(m["voice_name"]),
+		Status:          status,
+		Approved:        approvedFlag || status == "approved",
+		VoiceReference:  stringOrEmpty(m["voice_reference"]),
+		RejectionReason: stringOrEmpty(m["rejection_reason"]),
+		UpdatedInPlace:  updatedInPlace,
+		SupersededIDs:   superseded,
+		Raw:             m,
+	}
+}
+
+func buildCustomPromptSummary(m map[string]any) CustomPromptSummary {
+	return CustomPromptSummary{
+		ID:              stringOrEmpty(m["id"]),
+		VoiceName:       stringOrEmpty(m["voice_name"]),
+		Status:          stringOrEmpty(m["status"]),
+		VoiceReference:  stringOrEmpty(m["voice_reference"]),
+		ApprovedAlias:   stringOrEmpty(m["approved_alias"]),
+		RejectionReason: stringOrEmpty(m["rejection_reason"]),
+		SubmittedAt:     stringOrEmpty(m["submitted_at"]),
+		ReviewedAt:      stringOrEmpty(m["reviewed_at"]),
+	}
+}
+
+func buildCustomPromptList(m map[string]any) *CustomPromptList {
+	raw, _ := m["custom_prompts"].([]any)
+	out := make([]CustomPromptSummary, 0, len(raw))
+	for _, r := range raw {
+		row, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, buildCustomPromptSummary(row))
+	}
+	return &CustomPromptList{
+		CustomerID:    stringOrEmpty(m["customer_id"]),
+		CustomPrompts: out,
+		Raw:           m,
+	}
+}
+
+func buildCustomPromptDetail(m map[string]any) *CustomPromptDetail {
+	return &CustomPromptDetail{
+		ID:               stringOrEmpty(m["id"]),
+		CustomerID:       stringOrEmpty(m["customer_id"]),
+		VoiceName:        stringOrEmpty(m["voice_name"]),
+		Instruction:      stringOrEmpty(m["instruction"]),
+		Status:           stringOrEmpty(m["status"]),
+		VoiceReference:   stringOrEmpty(m["voice_reference"]),
+		ApprovedAlias:    stringOrEmpty(m["approved_alias"]),
+		RejectionReason:  stringOrEmpty(m["rejection_reason"]),
+		JudgeVerdictJSON: stringOrEmpty(m["judge_verdict_json"]),
+		SubmittedAt:      stringOrEmpty(m["submitted_at"]),
+		ReviewedAt:       stringOrEmpty(m["reviewed_at"]),
+		Raw:              m,
+	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
