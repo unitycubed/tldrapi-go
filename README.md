@@ -1,31 +1,12 @@
+> ### ⚠️ Service notice
+>
+> **The RapidAPI listing that backs this SDK is temporarily unavailable while we work through a launch-day issue. Please check back in a few days.**
+
 # tldrapi-go — Go SDK for TLDRapi
 
-Official Go client for the [TLDRapi](https://tldrapi-summarizer.p.rapidapi.com/)
+Official Go client for the [TLDRapi](https://unitycubed.dev/TLDRapi/)
 text-summarization API. Zero third-party dependencies — uses only
 `net/http` and `encoding/json` from the standard library.
-
-## Get your app's RapidAPI key
-
-1. Sign in at [rapidapi.com](https://rapidapi.com)
-2. Subscribe to the [TLDRapi Summarizer](https://rapidapi.com/thunderAPIs256/api/tldrapi-summarizer) listing (start with **BASIC** — free)
-3. Go to **Console** (top nav) → **Applications** → **Add App** (or open an existing one)
-4. In the App → **Authorizations** tab → click the copy icon next to your Authorization Key
-
-That's the app's `X-RapidAPI-Key`. Pass it to the SDK constructor.
-
-*Legacy path (deprecated): upper-right (?) → Legacy Developer Dashboard → Add New App → Authorization tab. The new Console path above is simpler.*
-
-The Authorization Key field is the same value in both places — RapidAPI just labels it differently depending on which interface you use:
-
-**New Console:**
-
-![RapidAPI Console — Authorization Method labeled "RAPIDAPI"](https://raw.githubusercontent.com/unitycubed/tldrapi-docs/main/img/rapidapi-key-label-console.png)
-
-**Legacy Developer Dashboard:**
-
-![RapidAPI Legacy Developer Dashboard — Authorization Method labeled "API key"](https://raw.githubusercontent.com/unitycubed/tldrapi-docs/main/img/rapidapi-key-label-legacy.png)
-
-
 
 ## Install
 
@@ -74,10 +55,76 @@ func main() {
 }
 ```
 
-## Quality tiers
+## Quality levels
 
 Pass one of `TierQuick`, `TierStandard`, `TierDeep`, `TierPremium`,
 `TierUltra`. Leave `Tier` empty for the free tier's default.
+
+Credit cost scales with input size (v2.1):
+`cost = 1 + Σ over chunks of (base × ceil(chunk_tokens / 1000))`.
+Base costs and chunk caps are dynamic — fetch the current schedule
+with `c.Rates(ctx)` or from `GET /rates`.
+
+## Advanced quality controls (v-session129+)
+
+Every summarize call is parameterized by three orthogonal knobs. Send
+zero (default `standard`) — or set `Tier` for a named preset — or
+set 1-3 optional axis fields. Both together: axes override the preset
+and server returns `X-Quality-Warning`.
+
+**30 named presets.** `Tier` accepts any of `{minimal|brief|balanced|
+thorough|detailed|complete}-{quick|standard|deep|premium|ultra}`
+(e.g. `TierQuick`, or raw string `"thorough-standard"` /
+`"complete-quick"`). The 5 short canonical names are the
+SCORECARD-validated highlighted presets; the other 25 are extrapolated.
+
+**Three optional axis overrides** on `SummarizeOptions`:
+
+- `OptionalQuality` — `quick | standard | deep | premium | ultra`
+- `OptionalExtractiveLvl` — `minimal | brief | balanced | thorough | detailed | complete`
+- `OptionalStrategy` — `contextual-compression | premium-single-shot | hierarchical-merge`
+
+```go
+// Named preset (extrapolated)
+r, _ := c.Summarize(ctx, text, tldrapi.SummarizeOptions{Tier: "thorough-quick"})
+
+// One axis override
+r, _ := c.Summarize(ctx, text, tldrapi.SummarizeOptions{
+    Tier: tldrapi.TierPremium,
+    OptionalExtractiveLvl: "brief",
+})
+
+// All three axes
+r, _ := c.Summarize(ctx, text, tldrapi.SummarizeOptions{
+    OptionalQuality: "ultra",
+    OptionalExtractiveLvl: "complete",
+    OptionalStrategy: "premium-single-shot",
+})
+```
+
+### Paid-tier quality guarantees
+
+Default = strict wait for the tier's primary model. Opt into
+permissive fallback with `AllowDowngrade: true`. Response may then
+set `X-Quality-Actual` naming the tier that actually served.
+
+```go
+r, _ := c.Summarize(ctx, text, tldrapi.SummarizeOptions{
+    Tier: tldrapi.TierPremium,
+    AllowDowngrade: true,
+})
+```
+
+### Async submit + poll
+
+```go
+rid, _ := c.SubmitAsync(ctx, text, tldrapi.SummarizeOptions{Tier: tldrapi.TierUltra})
+r, _ := c.WaitForResult(ctx, rid, 5*time.Minute, 5*time.Second)
+```
+
+Or manual: `c.GetResult(ctx, rid)` returns `(nil, nil)` while queued,
+`(*SummarizeResult, nil)` when ready. Credits deducted at submit time,
+refunded on failure like sync.
 
 ## Error handling
 
@@ -121,6 +168,4 @@ a deadline for cancellation.
 
 ## License
 
-Released under the MIT License — see [LICENSE](LICENSE).
-
-Copyright (c) 2026 Ehren Biglari / Unity Cubed.
+MIT — see [LICENSE](./LICENSE).

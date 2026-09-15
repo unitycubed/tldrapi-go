@@ -183,6 +183,18 @@ func (c *Client) Summarize(ctx context.Context, inputText string, opts Summarize
 	if opts.AllowOverage {
 		headers["X-Allow-Overage"] = "true"
 	}
+	if opts.AllowDowngrade {
+		headers["X-Allow-Downgrade"] = "true"
+	}
+	if opts.OptionalQuality != "" {
+		headers["X-Optional-Quality"] = opts.OptionalQuality
+	}
+	if opts.OptionalExtractiveLvl != "" {
+		headers["X-Optional-Extractive-Lvl"] = opts.OptionalExtractiveLvl
+	}
+	if opts.OptionalStrategy != "" {
+		headers["X-Optional-Strategy"] = opts.OptionalStrategy
+	}
 
 	rawBody, respHeaders, err := c.request(ctx, "POST", "/summarize", payload, headers, opts.TimeoutSeconds)
 	if err != nil {
@@ -198,6 +210,105 @@ func (c *Client) Summarize(ctx context.Context, inputText string, opts Summarize
 		}}
 	}
 	return buildSummarizeResult(respJSON, respHeaders), nil
+}
+
+// SubmitAsync (#423): submit a paid-tier summarize and return the
+// request_id. Fetch the result via GetResult(requestID) or block-poll
+// via WaitForResult(requestID, ...). Credits are deducted at submit
+// time and refunded on failure exactly like Summarize().
+func (c *Client) SubmitAsync(ctx context.Context, inputText string, opts SummarizeOptions) (string, error) {
+	if inputText == "" {
+		return "", errors.New("tldrapi: inputText must be non-empty")
+	}
+	if opts.Tier != "" && !validTiers[opts.Tier] {
+		return "", fmt.Errorf("tldrapi: invalid tier %q", opts.Tier)
+	}
+	payload, err := json.Marshal(map[string]any{"input_text": inputText})
+	if err != nil {
+		return "", fmt.Errorf("tldrapi: marshal request: %w", err)
+	}
+	headers := c.buildHeaders(opts.Tier, opts.ExtraHeaders)
+	headers["X-Async"] = "true"
+	if opts.AllowDowngrade {
+		headers["X-Allow-Downgrade"] = "true"
+	}
+	if opts.OptionalQuality != "" {
+		headers["X-Optional-Quality"] = opts.OptionalQuality
+	}
+	if opts.OptionalExtractiveLvl != "" {
+		headers["X-Optional-Extractive-Lvl"] = opts.OptionalExtractiveLvl
+	}
+	if opts.OptionalStrategy != "" {
+		headers["X-Optional-Strategy"] = opts.OptionalStrategy
+	}
+	_, respHeaders, err := c.request(ctx, "POST", "/summarize", payload, headers, opts.TimeoutSeconds)
+	if err != nil {
+		return "", err
+	}
+	rid := respHeaders.Get("X-Paid-Request-Id")
+	if rid == "" {
+		return "", &ServerError{APIError: &APIError{
+			Message:    "async submit returned no X-Paid-Request-Id",
+			StatusCode: 202,
+			RequestID:  respHeaders.Get("X-Request-Id"),
+		}}
+	}
+	return rid, nil
+}
+
+// GetResult (#423): fetch the async summarize result. Returns
+// (nil, nil) if still queued (server 202). Returns (result, nil) on
+// 200. Returns error on 4xx/5xx.
+func (c *Client) GetResult(ctx context.Context, requestID string) (*SummarizeResult, error) {
+	if requestID == "" {
+		return nil, errors.New("tldrapi: requestID must be non-empty")
+	}
+	headers := c.buildHeaders("", nil)
+	rawBody, respHeaders, err := c.request(ctx, "GET", "/paid/result/"+requestID, nil, headers, 0)
+	if err != nil {
+		if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == 202 {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var respJSON map[string]any
+	if err := json.Unmarshal(rawBody, &respJSON); err != nil {
+		return nil, &ServerError{APIError: &APIError{
+			Message:    fmt.Sprintf("unexpected non-JSON result: %s", truncateForLog(rawBody, 200)),
+			StatusCode: 200,
+			RequestID:  respHeaders.Get("X-Request-Id"),
+		}}
+	}
+	return buildSummarizeResult(respJSON, respHeaders), nil
+}
+
+// WaitForResult (#423): block-poll GetResult until ready. `timeout`
+// bounds total wait; 0 = no cap. `pollInterval` defaults to 5 seconds.
+func (c *Client) WaitForResult(ctx context.Context, requestID string, timeout, pollInterval time.Duration) (*SummarizeResult, error) {
+	if pollInterval <= 0 {
+		pollInterval = 5 * time.Second
+	}
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		r, err := c.GetResult(ctx, requestID)
+		if err != nil {
+			return nil, err
+		}
+		if r != nil {
+			return r, nil
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return nil, fmt.Errorf("tldrapi: WaitForResult %s still pending after %s", requestID, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // Rates fetches /rates — the credit-per-call table for each quality tier.

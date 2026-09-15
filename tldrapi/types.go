@@ -57,6 +57,20 @@ type SummarizeOptions struct {
 	Config *SummarizeConfig
 	// AllowOverage: opt-in to going over your daily credit budget.
 	AllowOverage bool
+	// AllowDowngrade (#422): opt-in to permissive paid-tier downgrade
+	// when the tier's primary model is unavailable. Sets X-Allow-Downgrade.
+	AllowDowngrade bool
+	// OptionalQuality (#434): LLM tier override —
+	// quick|standard|deep|premium|ultra. Sets X-Optional-Quality.
+	OptionalQuality string
+	// OptionalExtractiveLvl (#434): retention override —
+	// minimal|brief|balanced|thorough|detailed|complete. Sets
+	// X-Optional-Extractive-Lvl.
+	OptionalExtractiveLvl string
+	// OptionalStrategy (#434): inference strategy override —
+	// contextual-compression|premium-single-shot|hierarchical-merge.
+	// Sets X-Optional-Strategy.
+	OptionalStrategy string
 	// ExtraHeaders lets callers pass arbitrary headers (rare;
 	// primarily for debugging or forwarding X-Trace-ID from a caller).
 	ExtraHeaders map[string]string
